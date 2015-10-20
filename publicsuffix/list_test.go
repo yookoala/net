@@ -444,6 +444,9 @@ var icannTLDTestCases = []struct {
 
 	// Domain with a private public suffix should return the ICANN public suffix.
 	{"foo.compute-1.amazonaws.com", "com"},
+	// Domain equal to a private public suffix should return the ICANN public
+	// suffix.
+	{"cloudapp.net", "net"},
 }
 
 func TestICANNTLD(t *testing.T) {
