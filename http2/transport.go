@@ -9,6 +9,7 @@ package http2
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -57,20 +58,61 @@ type Transport struct {
 	// tls.Client. If nil, the default configuration is used.
 	TLSClientConfig *tls.Config
 
-	// TODO: switch to RWMutex
-	// TODO: add support for sharing conns based on cert names
-	// (e.g. share conn for googleapis.com and appspot.com)
-	connMu sync.Mutex
-	conns  map[string][]*clientConn // key is host:port
+	// ConnPool optionally specifies an alternate connection pool to use.
+	// If nil, the default is used.
+	ConnPool ClientConnPool
+
+	// DisableCompression, if true, prevents the Transport from
+	// requesting compression with an "Accept-Encoding: gzip"
+	// request header when the Request contains no existing
+	// Accept-Encoding value. If the Transport requests gzip on
+	// its own and gets a gzipped response, it's transparently
+	// decoded in the Response.Body. However, if the user
+	// explicitly requested gzip it is not automatically
+	// uncompressed.
+	DisableCompression bool
+
+	connPoolOnce  sync.Once
+	connPoolOrDef ClientConnPool // non-nil version of ConnPool
 }
 
-// clientConn is the state of a single HTTP/2 client connection to an
+func (t *Transport) disableCompression() bool {
+	if t.DisableCompression {
+		return true
+	}
+	// TODO: also disable if this transport is somehow linked to an http1 Transport
+	// and it's configured there?
+	return false
+}
+
+var errTransportVersion = errors.New("http2: ConfigureTransport is only supported starting at Go 1.6")
+
+// ConfigureTransport configures a net/http HTTP/1 Transport to use HTTP/2.
+// It requires Go 1.6 or later and returns an error if the net/http package is too old
+// or if t1 has already been HTTP/2-enabled.
+func ConfigureTransport(t1 *http.Transport) error {
+	return configureTransport(t1) // in configure_transport.go (go1.6) or go15.go
+}
+
+func (t *Transport) connPool() ClientConnPool {
+	t.connPoolOnce.Do(t.initConnPool)
+	return t.connPoolOrDef
+}
+
+func (t *Transport) initConnPool() {
+	if t.ConnPool != nil {
+		t.connPoolOrDef = t.ConnPool
+	} else {
+		t.connPoolOrDef = &clientConnPool{t: t}
+	}
+}
+
+// ClientConn is the state of a single HTTP/2 client connection to an
 // HTTP/2 server.
-type clientConn struct {
+type ClientConn struct {
 	t        *Transport
-	tconn    net.Conn
-	tlsState *tls.ConnectionState
-	connKey  []string // key(s) this connection is cached in, in t.conns
+	tconn    net.Conn             // usually *tls.Conn, except specialized impls
+	tlsState *tls.ConnectionState // nil only for specialized impls
 
 	// readLoop goroutine fields:
 	readerDone chan struct{} // closed on error
@@ -102,13 +144,18 @@ type clientConn struct {
 // clientStream is the state for a single HTTP/2 stream. One of these
 // is created for each Transport.RoundTrip call.
 type clientStream struct {
-	cc      *clientConn
-	ID      uint32
-	resc    chan resAndError
-	bufPipe pipe // buffered pipe with the flow-controlled response payload
+	cc            *ClientConn
+	req           *http.Request
+	ID            uint32
+	resc          chan resAndError
+	bufPipe       pipe // buffered pipe with the flow-controlled response payload
+	requestedGzip bool
 
-	flow   flow // guarded by cc.mu
-	inflow flow // guarded by cc.mu
+	flow        flow  // guarded by cc.mu
+	inflow      flow  // guarded by cc.mu
+	bytesRemain int64 // -1 means unknown; owned by transportResponseBody.Read
+	readErr     error // sticky read error; owned by transportResponseBody.Read
+	stopReqBody bool  // stop writing req body; guarded by cc.mu
 
 	peerReset chan struct{} // closed on peer reset
 	resetErr  error         // populated before peerReset is closed
@@ -125,6 +172,14 @@ func (cs *clientStream) checkReset() error {
 	}
 }
 
+func (cs *clientStream) abortRequestBodyWrite() {
+	cc := cs.cc
+	cc.mu.Lock()
+	cs.stopReqBody = true
+	cc.cond.Broadcast()
+	cc.mu.Unlock()
+}
+
 type stickyErrWriter struct {
 	w   io.Writer
 	err *error
@@ -139,24 +194,44 @@ func (sew stickyErrWriter) Write(p []byte) (n int, err error) {
 	return
 }
 
+var ErrNoCachedConn = errors.New("http2: no cached connection was available")
+
+// RoundTripOpt are options for the Transport.RoundTripOpt method.
+type RoundTripOpt struct {
+	// OnlyCachedConn controls whether RoundTripOpt may
+	// create a new TCP connection. If set true and
+	// no cached connection is available, RoundTripOpt
+	// will return ErrNoCachedConn.
+	OnlyCachedConn bool
+}
+
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.RoundTripOpt(req, RoundTripOpt{})
+}
+
+// authorityAddr returns a given authority (a host/IP, or host:port / ip:port)
+// and returns a host:port. The port 443 is added if needed.
+func authorityAddr(authority string) (addr string) {
+	if _, _, err := net.SplitHostPort(authority); err == nil {
+		return authority
+	}
+	return net.JoinHostPort(authority, "443")
+}
+
+// RoundTripOpt is like RoundTrip, but takes options.
+func (t *Transport) RoundTripOpt(req *http.Request, opt RoundTripOpt) (*http.Response, error) {
 	if req.URL.Scheme != "https" {
 		return nil, errors.New("http2: unsupported scheme")
 	}
 
-	host, port, err := net.SplitHostPort(req.URL.Host)
-	if err != nil {
-		host = req.URL.Host
-		port = "443"
-	}
-
+	addr := authorityAddr(req.URL.Host)
 	for {
-		cc, err := t.getClientConn(host, port)
+		cc, err := t.connPool().GetClientConn(req, addr)
 		if err != nil {
 			return nil, err
 		}
-		res, err := cc.roundTrip(req)
-		if shouldRetryRequest(err) { // TODO: or clientconn is overloaded (too many outstanding requests)?
+		res, err := cc.RoundTrip(req)
+		if shouldRetryRequest(req, err) {
 			continue
 		}
 		if err != nil {
@@ -170,113 +245,32 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 // connected from previous requests but are now sitting idle.
 // It does not interrupt any connections currently in use.
 func (t *Transport) CloseIdleConnections() {
-	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	for _, vv := range t.conns {
-		for _, cc := range vv {
-			cc.closeIfIdle()
-		}
+	if cp, ok := t.connPool().(*clientConnPool); ok {
+		cp.closeIdleConnections()
 	}
 }
 
-var errClientConnClosed = errors.New("http2: client conn is closed")
+var (
+	errClientConnClosed   = errors.New("http2: client conn is closed")
+	errClientConnUnusable = errors.New("http2: client conn not usable")
+)
 
-func shouldRetryRequest(err error) bool {
-	// TODO: or GOAWAY graceful shutdown stuff
-	return err == errClientConnClosed
+func shouldRetryRequest(req *http.Request, err error) bool {
+	// TODO: retry GET requests (no bodies) more aggressively, if shutdown
+	// before response.
+	return err == errClientConnUnusable
 }
 
-func (t *Transport) removeClientConn(cc *clientConn) {
-	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	for _, key := range cc.connKey {
-		vv, ok := t.conns[key]
-		if !ok {
-			continue
-		}
-		newList := filterOutClientConn(vv, cc)
-		if len(newList) > 0 {
-			t.conns[key] = newList
-		} else {
-			delete(t.conns, key)
-		}
-	}
-}
-
-func filterOutClientConn(in []*clientConn, exclude *clientConn) []*clientConn {
-	out := in[:0]
-	for _, v := range in {
-		if v != exclude {
-			out = append(out, v)
-		}
-	}
-	// If we filtered it out, zero out the last item to prevent
-	// the GC from seeing it.
-	if len(in) != len(out) {
-		in[len(in)-1] = nil
-	}
-	return out
-}
-
-// AddIdleConn adds c as an idle conn for Transport.
-// It assumes that c has not yet exchanged SETTINGS frames.
-// The addr maybe be either "host" or "host:port".
-func (t *Transport) AddIdleConn(addr string, c *tls.Conn) error {
-	var key string
-	_, _, err := net.SplitHostPort(addr)
-	if err == nil {
-		key = addr
-	} else {
-		key = addr + ":443"
-	}
-	cc, err := t.newClientConn(key, c)
-	if err != nil {
-		return err
-	}
-
-	t.addConn(key, cc)
-	return nil
-}
-
-func (t *Transport) addConn(key string, cc *clientConn) {
-	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	if t.conns == nil {
-		t.conns = make(map[string][]*clientConn)
-	}
-	t.conns[key] = append(t.conns[key], cc)
-}
-
-func (t *Transport) getClientConn(host, port string) (*clientConn, error) {
-	key := net.JoinHostPort(host, port)
-
-	t.connMu.Lock()
-	for _, cc := range t.conns[key] {
-		if cc.canTakeNewRequest() {
-			t.connMu.Unlock()
-			return cc, nil
-		}
-	}
-	t.connMu.Unlock()
-
-	// TODO(bradfitz): use a singleflight.Group to only lock once per 'key'.
-	// Probably need to vendor it in as github.com/golang/sync/singleflight
-	// though, since the net package already uses it? Also lines up with
-	// sameer, bcmills, et al wanting to open source some sync stuff.
-	cc, err := t.dialClientConn(host, port, key)
+func (t *Transport) dialClientConn(addr string) (*ClientConn, error) {
+	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
-	t.addConn(key, cc)
-	return cc, nil
-}
-
-func (t *Transport) dialClientConn(host, port, key string) (*clientConn, error) {
-	tconn, err := t.dialTLS()("tcp", net.JoinHostPort(host, port), t.newTLSConfig(host))
+	tconn, err := t.dialTLS()("tcp", addr, t.newTLSConfig(host))
 	if err != nil {
 		return nil, err
 	}
-	return t.newClientConn(key, tconn)
+	return t.NewClientConn(tconn)
 }
 
 func (t *Transport) newTLSConfig(host string) *tls.Config {
@@ -319,15 +313,14 @@ func (t *Transport) dialTLSDefault(network, addr string, cfg *tls.Config) (net.C
 	return cn, nil
 }
 
-func (t *Transport) newClientConn(key string, tconn net.Conn) (*clientConn, error) {
-	if _, err := tconn.Write(clientPreface); err != nil {
+func (t *Transport) NewClientConn(c net.Conn) (*ClientConn, error) {
+	if _, err := c.Write(clientPreface); err != nil {
 		return nil, err
 	}
 
-	cc := &clientConn{
+	cc := &ClientConn{
 		t:                    t,
-		tconn:                tconn,
-		connKey:              []string{key}, // TODO: cert's validated hostnames too
+		tconn:                c,
 		readerDone:           make(chan struct{}),
 		nextStreamID:         1,
 		maxFrameSize:         16 << 10, // spec default
@@ -340,15 +333,15 @@ func (t *Transport) newClientConn(key string, tconn net.Conn) (*clientConn, erro
 
 	// TODO: adjust this writer size to account for frame size +
 	// MTU + crypto/tls record padding.
-	cc.bw = bufio.NewWriter(stickyErrWriter{tconn, &cc.werr})
-	cc.br = bufio.NewReader(tconn)
+	cc.bw = bufio.NewWriter(stickyErrWriter{c, &cc.werr})
+	cc.br = bufio.NewReader(c)
 	cc.fr = NewFramer(cc.bw, cc.br)
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
 
 	type connectionStater interface {
 		ConnectionState() tls.ConnectionState
 	}
-	if cs, ok := tconn.(connectionStater); ok {
+	if cs, ok := c.(connectionStater); ok {
 		state := cs.ConnectionState()
 		cc.tlsState = &state
 	}
@@ -395,21 +388,25 @@ func (t *Transport) newClientConn(key string, tconn net.Conn) (*clientConn, erro
 	return cc, nil
 }
 
-func (cc *clientConn) setGoAway(f *GoAwayFrame) {
+func (cc *ClientConn) setGoAway(f *GoAwayFrame) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	cc.goAway = f
 }
 
-func (cc *clientConn) canTakeNewRequest() bool {
+func (cc *ClientConn) CanTakeNewRequest() bool {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
+	return cc.canTakeNewRequestLocked()
+}
+
+func (cc *ClientConn) canTakeNewRequestLocked() bool {
 	return cc.goAway == nil &&
 		int64(len(cc.streams)+1) < int64(cc.maxConcurrentStreams) &&
 		cc.nextStreamID < 2147483647
 }
 
-func (cc *clientConn) closeIfIdle() {
+func (cc *ClientConn) closeIfIdle() {
 	cc.mu.Lock()
 	if len(cc.streams) > 0 {
 		cc.mu.Unlock()
@@ -428,7 +425,7 @@ const maxAllocFrameSize = 512 << 10
 // They're capped at the min of the peer's max frame size or 512KB
 // (kinda arbitrarily), but definitely capped so we don't allocate 4GB
 // bufers.
-func (cc *clientConn) frameScratchBuffer() []byte {
+func (cc *ClientConn) frameScratchBuffer() []byte {
 	cc.mu.Lock()
 	size := cc.maxFrameSize
 	if size > maxAllocFrameSize {
@@ -445,7 +442,7 @@ func (cc *clientConn) frameScratchBuffer() []byte {
 	return make([]byte, size)
 }
 
-func (cc *clientConn) putFrameScratchBuffer(buf []byte) {
+func (cc *ClientConn) putFrameScratchBuffer(buf []byte) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	const maxBufs = 4 // arbitrary; 4 concurrent requests per conn? investigate.
@@ -462,20 +459,41 @@ func (cc *clientConn) putFrameScratchBuffer(buf []byte) {
 	// forget about it.
 }
 
-func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
+func (cc *ClientConn) RoundTrip(req *http.Request) (*http.Response, error) {
 	cc.mu.Lock()
 
-	if cc.closed {
+	if cc.closed || !cc.canTakeNewRequestLocked() {
 		cc.mu.Unlock()
-		return nil, errClientConnClosed
+		return nil, errClientConnUnusable
 	}
 
 	cs := cc.newStream()
+	cs.req = req
 	hasBody := req.Body != nil
 
-	// we send: HEADERS[+CONTINUATION] + (DATA?)
-	hdrs := cc.encodeHeaders(req)
-	first := true
+	// TODO(bradfitz): this is a copy of the logic in net/http. Unify somewhere?
+	if !cc.t.disableCompression() &&
+		req.Header.Get("Accept-Encoding") == "" &&
+		req.Header.Get("Range") == "" &&
+		req.Method != "HEAD" {
+		// Request gzip only, not deflate. Deflate is ambiguous and
+		// not as universally supported anyway.
+		// See: http://www.gzip.org/zlib/zlib_faq.html#faq38
+		//
+		// Note that we don't request this for HEAD requests,
+		// due to a bug in nginx:
+		//   http://trac.nginx.org/nginx/ticket/358
+		//   https://golang.org/issue/5522
+		//
+		// We don't request gzip if the request is for a range, since
+		// auto-decoding a portion of a gzipped document will just fail
+		// anyway. See https://golang.org/issue/8923
+		cs.requestedGzip = true
+	}
+
+	// we send: HEADERS{1}, CONTINUATION{0,} + DATA{0,}
+	hdrs := cc.encodeHeaders(req, cs.requestedGzip)
+	first := true // first frame written (HEADERS is first, then CONTINUATION)
 
 	cc.wmu.Lock()
 	frameSize := int(cc.maxFrameSize)
@@ -507,26 +525,33 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 		return nil, werr
 	}
 
-	var bodyCopyErrc chan error
-	var gotResHeaders chan struct{} // closed on resheaders
+	var bodyCopyErrc chan error // result of body copy
 	if hasBody {
 		bodyCopyErrc = make(chan error, 1)
-		gotResHeaders = make(chan struct{})
 		go func() {
-			bodyCopyErrc <- cs.writeRequestBody(req.Body, gotResHeaders)
+			bodyCopyErrc <- cs.writeRequestBody(req.Body)
 		}()
 	}
 
 	for {
 		select {
 		case re := <-cs.resc:
-			if gotResHeaders != nil {
-				close(gotResHeaders)
+			res := re.res
+			if re.err != nil || res.StatusCode > 299 {
+				// On error or status code 3xx, 4xx, 5xx, etc abort any
+				// ongoing write, assuming that the server doesn't care
+				// about our request body. If the server replied with 1xx or
+				// 2xx, however, then assume the server DOES potentially
+				// want our body (e.g. full-duplex streaming:
+				// golang.org/issue/13444). If it turns out the server
+				// doesn't, they'll RST_STREAM us soon enough.  This is a
+				// heuristic to avoid adding knobs to Transport.  Hopefully
+				// we can keep it.
+				cs.abortRequestBodyWrite()
 			}
 			if re.err != nil {
 				return nil, re.err
 			}
-			res := re.res
 			res.Request = req
 			res.TLS = cc.tlsState
 			return res, nil
@@ -538,45 +563,56 @@ func (cc *clientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	}
 }
 
-var errServerResponseBeforeRequestBody = errors.New("http2: server sent response while still writing request body")
+// errAbortReqBodyWrite is an internal error value.
+// It doesn't escape to callers.
+var errAbortReqBodyWrite = errors.New("http2: aborting request body write")
 
-func (cs *clientStream) writeRequestBody(body io.Reader, gotResHeaders <-chan struct{}) error {
+func (cs *clientStream) writeRequestBody(body io.ReadCloser) (err error) {
 	cc := cs.cc
 	sentEnd := false // whether we sent the final DATA frame w/ END_STREAM
 	buf := cc.frameScratchBuffer()
 	defer cc.putFrameScratchBuffer(buf)
 
-	for !sentEnd {
-		var sawEOF bool
-		n, err := io.ReadFull(body, buf)
-		if err == io.ErrUnexpectedEOF {
+	defer func() {
+		// TODO: write h12Compare test showing whether
+		// Request.Body is closed by the Transport,
+		// and in multiple cases: server replies <=299 and >299
+		// while still writing request body
+		cerr := body.Close()
+		if err == nil {
+			err = cerr
+		}
+	}()
+
+	var sawEOF bool
+	for !sawEOF {
+		n, err := body.Read(buf)
+		if err == io.EOF {
 			sawEOF = true
 			err = nil
-		} else if err == io.EOF {
-			break
 		} else if err != nil {
 			return err
 		}
 
-		toWrite := buf[:n]
-		for len(toWrite) > 0 && err == nil {
+		remain := buf[:n]
+		for len(remain) > 0 && err == nil {
 			var allowed int32
-			allowed, err = cs.awaitFlowControl(int32(len(toWrite)))
+			allowed, err = cs.awaitFlowControl(len(remain))
 			if err != nil {
 				return err
 			}
-
 			cc.wmu.Lock()
-			select {
-			case <-gotResHeaders:
-				err = errServerResponseBeforeRequestBody
-			case <-cs.peerReset:
-				err = cs.resetErr
-			default:
-				data := toWrite[:allowed]
-				toWrite = toWrite[allowed:]
-				sentEnd = sawEOF && len(toWrite) == 0
-				err = cc.fr.WriteData(cs.ID, sentEnd, data)
+			data := remain[:allowed]
+			remain = remain[allowed:]
+			sentEnd = sawEOF && len(remain) == 0
+			err = cc.fr.WriteData(cs.ID, sentEnd, data)
+			if err == nil {
+				// TODO(bradfitz): this flush is for latency, not bandwidth.
+				// Most requests won't need this. Make this opt-in or opt-out?
+				// Use some heuristic on the body type? Nagel-like timers?
+				// Based on 'n'? Only last chunk of this for loop, unless flow control
+				// tokens are low? For now, always:
+				err = cc.bw.Flush()
 			}
 			cc.wmu.Unlock()
 		}
@@ -584,8 +620,6 @@ func (cs *clientStream) writeRequestBody(body io.Reader, gotResHeaders <-chan st
 			return err
 		}
 	}
-
-	var err error
 
 	cc.wmu.Lock()
 	if !sentEnd {
@@ -603,7 +637,7 @@ func (cs *clientStream) writeRequestBody(body io.Reader, gotResHeaders <-chan st
 // control tokens from the server.
 // It returns either the non-zero number of tokens taken or an error
 // if the stream is dead.
-func (cs *clientStream) awaitFlowControl(maxBytes int32) (taken int32, err error) {
+func (cs *clientStream) awaitFlowControl(maxBytes int) (taken int32, err error) {
 	cc := cs.cc
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
@@ -611,13 +645,17 @@ func (cs *clientStream) awaitFlowControl(maxBytes int32) (taken int32, err error
 		if cc.closed {
 			return 0, errClientConnClosed
 		}
+		if cs.stopReqBody {
+			return 0, errAbortReqBodyWrite
+		}
 		if err := cs.checkReset(); err != nil {
 			return 0, err
 		}
 		if a := cs.flow.available(); a > 0 {
 			take := a
-			if take > maxBytes {
-				take = maxBytes
+			if int(take) > maxBytes {
+
+				take = int32(maxBytes) // can't truncate int; take is int32
 			}
 			if take > int32(cc.maxFrameSize) {
 				take = int32(cc.maxFrameSize)
@@ -630,7 +668,7 @@ func (cs *clientStream) awaitFlowControl(maxBytes int32) (taken int32, err error
 }
 
 // requires cc.mu be held.
-func (cc *clientConn) encodeHeaders(req *http.Request) []byte {
+func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool) []byte {
 	cc.hbuf.Reset()
 
 	// TODO(bradfitz): figure out :authority-vs-Host stuff between http2 and Go
@@ -658,10 +696,13 @@ func (cc *clientConn) encodeHeaders(req *http.Request) []byte {
 			cc.writeHeader(lowKey, v)
 		}
 	}
+	if addGzipHeader {
+		cc.writeHeader("accept-encoding", "gzip")
+	}
 	return cc.hbuf.Bytes()
 }
 
-func (cc *clientConn) writeHeader(name, value string) {
+func (cc *ClientConn) writeHeader(name, value string) {
 	cc.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
 }
 
@@ -671,7 +712,7 @@ type resAndError struct {
 }
 
 // requires cc.mu be held.
-func (cc *clientConn) newStream() *clientStream {
+func (cc *ClientConn) newStream() *clientStream {
 	cs := &clientStream{
 		cc:        cc,
 		ID:        cc.nextStreamID,
@@ -687,7 +728,7 @@ func (cc *clientConn) newStream() *clientStream {
 	return cs
 }
 
-func (cc *clientConn) streamByID(id uint32, andRemove bool) *clientStream {
+func (cc *ClientConn) streamByID(id uint32, andRemove bool) *clientStream {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	cs := cc.streams[id]
@@ -699,7 +740,7 @@ func (cc *clientConn) streamByID(id uint32, andRemove bool) *clientStream {
 
 // clientConnReadLoop is the state owned by the clientConn's frame-reading readLoop.
 type clientConnReadLoop struct {
-	cc        *clientConn
+	cc        *ClientConn
 	activeRes map[uint32]*clientStream // keyed by streamID
 
 	// continueStreamID is the stream ID we're waiting for
@@ -715,7 +756,7 @@ type clientConnReadLoop struct {
 }
 
 // readLoop runs in its own goroutine and reads and dispatches frames.
-func (cc *clientConn) readLoop() {
+func (cc *ClientConn) readLoop() {
 	rl := &clientConnReadLoop{
 		cc:        cc,
 		activeRes: make(map[uint32]*clientStream),
@@ -735,7 +776,7 @@ func (cc *clientConn) readLoop() {
 func (rl *clientConnReadLoop) cleanup() {
 	cc := rl.cc
 	defer cc.tconn.Close()
-	defer cc.t.removeClientConn(cc)
+	defer cc.t.connPool().MarkDead(cc)
 	defer close(cc.readerDone)
 
 	// Close any response bodies if the server closes prematurely.
@@ -804,6 +845,8 @@ func (rl *clientConnReadLoop) run() error {
 			err = rl.processPushPromise(f)
 		case *WindowUpdateFrame:
 			err = rl.processWindowUpdate(f)
+		case *PingFrame:
+			err = rl.processPing(f)
 		default:
 			cc.logf("Transport: unhandled response frame type %T", f)
 		}
@@ -860,13 +903,38 @@ func (rl *clientConnReadLoop) processHeaderBlockFragment(frag []byte, streamID u
 	}
 
 	res := rl.nextRes
+
+	if !streamEnded || cs.req.Method == "HEAD" {
+		res.ContentLength = -1
+		if clens := res.Header["Content-Length"]; len(clens) == 1 {
+			if clen64, err := strconv.ParseInt(clens[0], 10, 64); err == nil {
+				res.ContentLength = clen64
+			} else {
+				// TODO: care? unlike http/1, it won't mess up our framing, so it's
+				// more safe smuggling-wise to ignore.
+			}
+		} else if len(clens) > 1 {
+			// TODO: care? unlike http/1, it won't mess up our framing, so it's
+			// more safe smuggling-wise to ignore.
+		}
+	}
+
 	if streamEnded {
 		res.Body = noBody
 	} else {
 		buf := new(bytes.Buffer) // TODO(bradfitz): recycle this garbage
 		cs.bufPipe = pipe{b: buf}
+		cs.bytesRemain = res.ContentLength
 		res.Body = transportResponseBody{cs}
+
+		if cs.requestedGzip && res.Header.Get("Content-Encoding") == "gzip" {
+			res.Header.Del("Content-Encoding")
+			res.Header.Del("Content-Length")
+			res.ContentLength = -1
+			res.Body = &gzipReader{body: res.Body}
+		}
 	}
+
 	rl.activeRes[cs.ID] = cs
 	cs.resc <- resAndError{res: res}
 	rl.nextRes = nil // unused now; will be reset next HEADERS frame
@@ -881,13 +949,35 @@ type transportResponseBody struct {
 }
 
 func (b transportResponseBody) Read(p []byte) (n int, err error) {
+	cs := b.cs
+	cc := cs.cc
+
+	if cs.readErr != nil {
+		return 0, cs.readErr
+	}
 	n, err = b.cs.bufPipe.Read(p)
+	if cs.bytesRemain != -1 {
+		if int64(n) > cs.bytesRemain {
+			n = int(cs.bytesRemain)
+			if err == nil {
+				err = errors.New("net/http: server replied with more than declared Content-Length; truncated")
+				cc.writeStreamReset(cs.ID, ErrCodeProtocol, err)
+			}
+			cs.readErr = err
+			return int(cs.bytesRemain), err
+		}
+		cs.bytesRemain -= int64(n)
+		if err == io.EOF && cs.bytesRemain > 0 {
+			err = io.ErrUnexpectedEOF
+			cs.readErr = err
+			return n, err
+		}
+	}
 	if n == 0 {
+		// No flow control tokens to send back.
 		return
 	}
 
-	cs := b.cs
-	cc := cs.cc
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
@@ -959,7 +1049,7 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 
 func (rl *clientConnReadLoop) processGoAway(f *GoAwayFrame) error {
 	cc := rl.cc
-	cc.t.removeClientConn(cc)
+	cc.t.connPool().MarkDead(cc)
 	if f.ErrCode != 0 {
 		// TODO: deal with GOAWAY more. particularly the error code
 		cc.vlogf("transport got GOAWAY with error code = %v", f.ErrCode)
@@ -1031,9 +1121,25 @@ func (rl *clientConnReadLoop) processResetStream(f *RSTStreamFrame) error {
 		cs.resetErr = err
 		close(cs.peerReset)
 		cs.bufPipe.CloseWithError(err)
+		cs.cc.cond.Broadcast() // wake up checkReset via clientStream.awaitFlowControl
 	}
 	delete(rl.activeRes, cs.ID)
 	return nil
+}
+
+func (rl *clientConnReadLoop) processPing(f *PingFrame) error {
+	if f.IsAck() {
+		// 6.7 PING: " An endpoint MUST NOT respond to PING frames
+		// containing this flag."
+		return nil
+	}
+	cc := rl.cc
+	cc.wmu.Lock()
+	defer cc.wmu.Unlock()
+	if err := cc.fr.WritePing(true, f.Data); err != nil {
+		return err
+	}
+	return cc.bw.Flush()
 }
 
 func (rl *clientConnReadLoop) processPushPromise(f *PushPromiseFrame) error {
@@ -1047,7 +1153,7 @@ func (rl *clientConnReadLoop) processPushPromise(f *PushPromiseFrame) error {
 	return ConnectionError(ErrCodeProtocol)
 }
 
-func (cc *clientConn) writeStreamReset(streamID uint32, code ErrCode, err error) {
+func (cc *ClientConn) writeStreamReset(streamID uint32, code ErrCode, err error) {
 	// TODO: do something with err? send it as a debug frame to the peer?
 	// But that's only in GOAWAY. Invent a new frame type? Is there one already?
 	cc.wmu.Lock()
@@ -1089,11 +1195,11 @@ func (rl *clientConnReadLoop) onNewHeaderField(f hpack.HeaderField) {
 	}
 }
 
-func (cc *clientConn) logf(format string, args ...interface{}) {
+func (cc *ClientConn) logf(format string, args ...interface{}) {
 	cc.t.logf(format, args...)
 }
 
-func (cc *clientConn) vlogf(format string, args ...interface{}) {
+func (cc *ClientConn) vlogf(format string, args ...interface{}) {
 	cc.t.vlogf(format, args...)
 }
 
@@ -1108,3 +1214,37 @@ func (t *Transport) logf(format string, args ...interface{}) {
 }
 
 var noBody io.ReadCloser = ioutil.NopCloser(bytes.NewReader(nil))
+
+func strSliceContains(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+type erringRoundTripper struct{ err error }
+
+func (rt erringRoundTripper) RoundTrip(*http.Request) (*http.Response, error) { return nil, rt.err }
+
+// gzipReader wraps a response body so it can lazily
+// call gzip.NewReader on the first call to Read
+type gzipReader struct {
+	body io.ReadCloser // underlying Response.Body
+	zr   io.Reader     // lazily-initialized gzip reader
+}
+
+func (gz *gzipReader) Read(p []byte) (n int, err error) {
+	if gz.zr == nil {
+		gz.zr, err = gzip.NewReader(gz.body)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return gz.zr.Read(p)
+}
+
+func (gz *gzipReader) Close() error {
+	return gz.body.Close()
+}
