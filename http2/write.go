@@ -1,9 +1,6 @@
 // Copyright 2014 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
-// See https://code.google.com/p/go/source/browse/CONTRIBUTORS
-// Licensed under the same terms as Go itself:
-// https://code.google.com/p/go/source/browse/LICENSE
 
 package http2
 
@@ -26,7 +23,11 @@ type writeFramer interface {
 // frame writing scheduler (see writeScheduler in writesched.go).
 //
 // This interface is implemented by *serverConn.
-// TODO: use it from the client code too, once it exists.
+//
+// TODO: decide whether to a) use this in the client code (which didn't
+// end up using this yet, because it has a simpler design, not
+// currently implementing priorities), or b) delete this and
+// make the server code a bit more concrete.
 type writeContext interface {
 	Framer() *Framer
 	Flush() error
@@ -44,6 +45,11 @@ func endsStream(w writeFramer) bool {
 		return v.endStream
 	case *writeResHeaders:
 		return v.endStream
+	case nil:
+		// This can only happen if the caller reuses w after it's
+		// been intentionally nil'ed out to prevent use. Keep this
+		// here to catch future refactoring breaking it.
+		panic("endsStream called on nil writeFramer")
 	}
 	return false
 }
@@ -113,6 +119,7 @@ type writeResHeaders struct {
 	h           http.Header // may be nil
 	endStream   bool
 
+	date          string
 	contentType   string
 	contentLength string
 }
@@ -136,6 +143,9 @@ func (w *writeResHeaders) writeFrame(ctx writeContext) error {
 	}
 	if w.contentLength != "" {
 		enc.WriteField(hpack.HeaderField{Name: "content-length", Value: w.contentLength})
+	}
+	if w.date != "" {
+		enc.WriteField(hpack.HeaderField{Name: "date", Value: w.date})
 	}
 
 	headerBlock := buf.Bytes()

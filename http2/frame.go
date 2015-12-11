@@ -1,7 +1,6 @@
-// Copyright 2014 The Go Authors.
-// See https://code.google.com/p/go/source/browse/CONTRIBUTORS
-// Licensed under the same terms as Go itself:
-// https://code.google.com/p/go/source/browse/LICENSE
+// Copyright 2014 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 package http2
 
@@ -575,6 +574,8 @@ type PingFrame struct {
 	Data [8]byte
 }
 
+func (f *PingFrame) IsAck() bool { return f.Flags.Has(FlagPingAck) }
+
 func parsePingFrame(fh FrameHeader, payload []byte) (Frame, error) {
 	if len(payload) != 8 {
 		return nil, ConnectionError(ErrCodeFrameSize)
@@ -663,7 +664,7 @@ func parseUnknownFrame(fh FrameHeader, p []byte) (Frame, error) {
 // See http://http2.github.io/http2-spec/#rfc.section.6.9
 type WindowUpdateFrame struct {
 	FrameHeader
-	Increment uint32
+	Increment uint32 // never read with high bit set
 }
 
 func parseWindowUpdateFrame(fh FrameHeader, p []byte) (Frame, error) {
