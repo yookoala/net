@@ -48,7 +48,10 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"os"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -482,12 +485,55 @@ func (sc *serverConn) logf(format string, args ...interface{}) {
 	}
 }
 
+// errno returns v's underlying uintptr, else 0.
+//
+// TODO: remove this helper function once http2 can use build
+// tags. See comment in isClosedConnError.
+func errno(v error) uintptr {
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Uintptr {
+		return uintptr(rv.Uint())
+	}
+	return 0
+}
+
+// isClosedConnError reports whether err is an error from use of a closed
+// network connection.
+func isClosedConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// TODO: remove this string search and be more like the Windows
+	// case below. That might involve modifying the standard library
+	// to return better error types.
+	str := err.Error()
+	if strings.Contains(str, "use of closed network connection") {
+		return true
+	}
+
+	// TODO(bradfitz): x/tools/cmd/bundle doesn't really support
+	// build tags, so I can't make an http2_windows.go file with
+	// Windows-specific stuff. Fix that and move this, once we
+	// have a way to bundle this into std's net/http somehow.
+	if runtime.GOOS == "windows" {
+		if oe, ok := err.(*net.OpError); ok && oe.Op == "read" {
+			if se, ok := oe.Err.(*os.SyscallError); ok && se.Syscall == "wsarecv" {
+				const WSAECONNABORTED = 10053
+				const WSAECONNRESET = 10054
+				if n := errno(se.Err); n == WSAECONNRESET || n == WSAECONNABORTED {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (sc *serverConn) condlogf(err error, format string, args ...interface{}) {
 	if err == nil {
 		return
 	}
-	str := err.Error()
-	if err == io.EOF || strings.Contains(str, "use of closed network connection") {
+	if err == io.EOF || err == io.ErrUnexpectedEOF || isClosedConnError(err) {
 		// Boring, expected errors.
 		sc.vlogf(format, args...)
 	} else {
@@ -501,7 +547,7 @@ func (sc *serverConn) onNewHeaderField(f hpack.HeaderField) {
 		sc.vlogf("http2: server decoded %v", f)
 	}
 	switch {
-	case !validHeader(f.Name):
+	case !validHeaderFieldValue(f.Value): // f.Name checked _after_ pseudo check, since ':' is invalid
 		sc.req.invalidHeader = true
 	case strings.HasPrefix(f.Name, ":"):
 		if sc.req.sawRegularHeader {
@@ -535,6 +581,8 @@ func (sc *serverConn) onNewHeaderField(f hpack.HeaderField) {
 			return
 		}
 		*dst = f.Value
+	case !validHeaderFieldName(f.Name):
+		sc.req.invalidHeader = true
 	default:
 		sc.req.sawRegularHeader = true
 		sc.req.header.Add(sc.canonicalHeader(f.Name), f.Value)
@@ -553,10 +601,10 @@ func (st *stream) onNewTrailerField(f hpack.HeaderField) {
 		sc.vlogf("http2: server decoded trailer %v", f)
 	}
 	switch {
-	case !validHeader(f.Name):
+	case strings.HasPrefix(f.Name, ":"):
 		sc.req.invalidHeader = true
 		return
-	case strings.HasPrefix(f.Name, ":"):
+	case !validHeaderFieldName(f.Name) || !validHeaderFieldValue(f.Value):
 		sc.req.invalidHeader = true
 		return
 	default:
@@ -1029,7 +1077,7 @@ func (sc *serverConn) processFrameFromReader(res readFrameResult) bool {
 			sc.goAway(ErrCodeFrameSize)
 			return true // goAway will close the loop
 		}
-		clientGone := err == io.EOF || strings.Contains(err.Error(), "use of closed network connection")
+		clientGone := err == io.EOF || err == io.ErrUnexpectedEOF || isClosedConnError(err)
 		if clientGone {
 			// TODO: could we also get into this state if
 			// the peer does a half close
@@ -1065,7 +1113,7 @@ func (sc *serverConn) processFrameFromReader(res readFrameResult) bool {
 		return true // goAway will handle shutdown
 	default:
 		if res.err != nil {
-			sc.logf("http2: server closing client connection; error reading frame from client %s: %v", sc.conn.RemoteAddr(), err)
+			sc.vlogf("http2: server closing client connection; error reading frame from client %s: %v", sc.conn.RemoteAddr(), err)
 		} else {
 			sc.logf("http2: server closing client connection: %v", err)
 		}
@@ -1926,7 +1974,9 @@ func (rws *responseWriterState) declareTrailer(k string) {
 		// Forbidden by RFC 2616 14.40.
 		return
 	}
-	rws.trailers = append(rws.trailers, k)
+	if !strSliceContains(rws.trailers, k) {
+		rws.trailers = append(rws.trailers, k)
+	}
 }
 
 // writeChunk writes chunks from the bufio.Writer. But because
@@ -1994,6 +2044,10 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 		return 0, nil
 	}
 
+	if rws.handlerDone {
+		rws.promoteUndeclaredTrailers()
+	}
+
 	endStream := rws.handlerDone && !rws.hasTrailers()
 	if len(p) > 0 || endStream {
 		// only send a 0 byte DATA frame if we're ending the stream.
@@ -2012,6 +2066,53 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 		return len(p), err
 	}
 	return len(p), nil
+}
+
+// TrailerPrefix is a magic prefix for ResponseWriter.Header map keys
+// that, if present, signals that the map entry is actually for
+// the response trailers, and not the response headers. The prefix
+// is stripped after the ServeHTTP call finishes and the values are
+// sent in the trailers.
+//
+// This mechanism is intended only for trailers that are not known
+// prior to the headers being written. If the set of trailers is fixed
+// or known before the header is written, the normal Go trailers mechanism
+// is preferred:
+//    https://golang.org/pkg/net/http/#ResponseWriter
+//    https://golang.org/pkg/net/http/#example_ResponseWriter_trailers
+const TrailerPrefix = "Trailer:"
+
+// promoteUndeclaredTrailers permits http.Handlers to set trailers
+// after the header has already been flushed. Because the Go
+// ResponseWriter interface has no way to set Trailers (only the
+// Header), and because we didn't want to expand the ResponseWriter
+// interface, and because nobody used trailers, and because RFC 2616
+// says you SHOULD (but not must) predeclare any trailers in the
+// header, the official ResponseWriter rules said trailers in Go must
+// be predeclared, and then we reuse the same ResponseWriter.Header()
+// map to mean both Headers and Trailers.  When it's time to write the
+// Trailers, we pick out the fields of Headers that were declared as
+// trailers. That worked for a while, until we found the first major
+// user of Trailers in the wild: gRPC (using them only over http2),
+// and gRPC libraries permit setting trailers mid-stream without
+// predeclarnig them. So: change of plans. We still permit the old
+// way, but we also permit this hack: if a Header() key begins with
+// "Trailer:", the suffix of that key is a Trailer. Because ':' is an
+// invalid token byte anyway, there is no ambiguity. (And it's already
+// filtered out) It's mildly hacky, but not terrible.
+//
+// This method runs after the Handler is done and promotes any Header
+// fields to be trailers.
+func (rws *responseWriterState) promoteUndeclaredTrailers() {
+	for k, vv := range rws.handlerHeader {
+		if !strings.HasPrefix(k, TrailerPrefix) {
+			continue
+		}
+		trailerKey := strings.TrimPrefix(k, TrailerPrefix)
+		rws.declareTrailer(trailerKey)
+		rws.handlerHeader[http.CanonicalHeaderKey(trailerKey)] = vv
+	}
+	sort.Strings(rws.trailers)
 }
 
 func (w *responseWriter) Flush() {
